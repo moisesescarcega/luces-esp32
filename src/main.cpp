@@ -1,30 +1,47 @@
 #include <Arduino.h>
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <time.h>
+#include <ESPmDNS.h>
+
+// ===== CONFIGURACIÓN WIFI =====
+const char* WIFI_SSID     = "INFINITUM0FED";   // Nombre de tu red WiFi
+const char* WIFI_PASSWORD = "dJAHF9TPTE"; // Contraseña de tu red WiFi
+
+// ===== CONFIGURACIÓN mDNS =====
+// Acceso por nombre: http://esp32-luces.local
+const char* MDNS_NAME = "esp32-luces";
+
+// ===== CONFIGURACIÓN NTP (hora en tiempo real) =====
+const char* NTP_SERVER = "pool.ntp.org";
+const long  GMT_OFFSET_SEC = -6 * 3600; // UTC-6 (México Centro) — ajusta si es necesario
+const int   DAYLIGHT_OFFSET_SEC = 0;
 
 // ===== CONFIGURACIÓN DE PINES =====
-const uint16_t kIrLed = 4;           // Diodo IR (LED tira)
-const int BUTTON_PIN = 19;           // Botón físico (para IR)
-const int PIR_SENSOR_PIN = 5;        // Sensor PIR (para Relé)
-const int RELAY_PIN = 12;            // Módulo Relé (para foco)
-const int INTERNAL_LED = 2;          // LED interno (feedback visual)
+const uint16_t kIrLed  = 4;  // Diodo IR (tira LED)
+const int RELAY_PIN    = 12; // Módulo Relé (foco)
+const int INTERNAL_LED = 2;  // LED interno (feedback visual)
 
-// ===== CONFIGURACIÓN DE TIEMPOS =====
-const unsigned long PIR_DEBOUNCE_MS = 2400;    // Debounce entre detecciones PIR
-const unsigned long PIR_GESTURE_WINDOW = 2500; // Ventana para contar gestos (ms)
-const unsigned long BUTTON_DEBOUNCE_MS = 200;  // Debounce del botón
-const unsigned long CLICK_DELAY = 400;         // Ventana de clics múltiples (IR)
+// ===== PROGRAMACIÓN HORARIA DE LA TIRA LED =====
+// Enciende de lunes a domingo de 18:30 a 22:30
+int scheduleOnHour   = 18;
+int scheduleOnMin    = 30;
+int scheduleOffHour  = 22;
+int scheduleOffMin   = 30;
+bool scheduleEnabled = true;
 
 // ===== VARIABLES DE ESTADO =====
 IRsend irsend(kIrLed);
-unsigned long lastButtonPress = 0;
-unsigned long lastPIRDetection = 0;
-unsigned long firstGestureTime = 0;
-int gestureCount = 0;
-int clickCount = 0;
-bool relayState = false;  // false = OFF, true = ON
+AsyncWebServer server(80);
+bool relayState      = false;
+bool ledStripState   = false;
+bool scheduleTriggeredOn  = false;
+bool scheduleTriggeredOff = false;
 
-// ===== SISTEMA IR (BOTÓN + TIRA LED) =====
+// ===== SISTEMA IR =====
 uint32_t buildConfirmedCode(uint8_t cmd) {
   uint8_t invCmd = ~cmd;
   return (uint32_t)0xFF << 24 | (uint32_t)0x00 << 16 | (uint32_t)cmd << 8 | invCmd;
@@ -39,40 +56,21 @@ void sendSignal(uint8_t cmd, const char* label) {
   digitalWrite(INTERNAL_LED, LOW);
 }
 
-void handleButtonPress() {
-  int buttonState = digitalRead(BUTTON_PIN);
-  
-  if (buttonState == LOW) {
-    unsigned long now = millis();
-    
-    // Antirrebote simple
-    if (now - lastButtonPress > BUTTON_DEBOUNCE_MS) {
-      clickCount++;
-      lastButtonPress = now;
-      Serial.printf("[BUTTON] Clic detectado... (Total: %d)\n", clickCount);
-    }
-    
-    // Esperar a que suelte el botón
-    while(digitalRead(BUTTON_PIN) == LOW);
-  }
-  
-  // Lógica de clics múltiples después de la ventana de tiempo
-  if (clickCount > 0 && (millis() - lastButtonPress > CLICK_DELAY)) {
-    if (clickCount == 1) {
-      Serial.println("[BUTTON] 1 clic → Enviando IR ENCENDIDO");
-      sendSignal(161, "ENCENDIDO");
-      sendSignal(162, "ENCENDIDO");
-      sendSignal(224, "ENCENDIDO");
-    } 
-    else if (clickCount >= 2) {
-      Serial.println("[BUTTON] 2+ clics → Enviando IR APAGADO");
-      sendSignal(226, "APAGADO");
-    }
-    clickCount = 0; // Reiniciar contador
-  }
+void irOn() {
+  sendSignal(161, "ON-1");
+  sendSignal(162, "ON-2");
+  sendSignal(224, "ON-3");
+  ledStripState = true;
+  Serial.println("[IR] Tira LED encendida");
 }
 
-// ===== SISTEMA PIR + RELÉ (SENSOR DE MOVIMIENTO + FOCO) =====
+void irOff() {
+  sendSignal(226, "OFF");
+  ledStripState = false;
+  Serial.println("[IR] Tira LED apagada");
+}
+
+// ===== SISTEMA RELÉ =====
 void setRelay(bool state) {
   relayState = state;
   digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
@@ -82,90 +80,254 @@ void setRelay(bool state) {
   Serial.printf("[RELAY] Estado: %s\n", relayState ? "ON" : "OFF");
 }
 
-void handlePIRDetection() {
-  unsigned long now = millis();
+// ===== PROGRAMACIÓN HORARIA =====
+void checkSchedule() {
+  if (!scheduleEnabled) return;
 
-  // Debouncing: ignorar señal PIR dentro de PIR_DEBOUNCE_MS
-  if (now - lastPIRDetection < PIR_DEBOUNCE_MS) {
-    return;
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+
+  int currentHour = timeinfo.tm_hour;
+  int currentMin  = timeinfo.tm_min;
+
+  bool isOnTime  = (currentHour == scheduleOnHour  && currentMin == scheduleOnMin);
+  bool isOffTime = (currentHour == scheduleOffHour && currentMin == scheduleOffMin);
+
+  if (isOnTime && !scheduleTriggeredOn) {
+    Serial.println("[SCHEDULE] Hora de encendido → Activando tira LED");
+    irOn();
+    scheduleTriggeredOn  = true;
+    scheduleTriggeredOff = false;
   }
 
-  // Solo registrar gesto si el PIR acaba de activarse (flanco de subida)
-  if (digitalRead(PIR_SENSOR_PIN) == LOW) {
-    return;
+  if (isOffTime && !scheduleTriggeredOff) {
+    Serial.println("[SCHEDULE] Hora de apagado → Apagando tira LED");
+    irOff();
+    scheduleTriggeredOff = true;
+    scheduleTriggeredOn  = false;
   }
 
-  lastPIRDetection = now;
-  gestureCount++;
-
-  // Registrar tiempo del primer gesto
-  if (gestureCount == 1) {
-    firstGestureTime = now;
-    Serial.println("[PIR] Primer gesto detectado, esperando segundo...");
-  } else {
-    Serial.printf("[PIR] Gesto %d detectado\n", gestureCount);
-  }
+  if (!isOnTime)  scheduleTriggeredOn  = false;
+  if (!isOffTime) scheduleTriggeredOff = false;
 }
 
-void evaluateGestures() {
-  if (gestureCount == 0) return;
-
-  unsigned long now = millis();
-
-  // Si la ventana de tiempo expiró, tomar decisión
-  if (now - firstGestureTime >= PIR_GESTURE_WINDOW) {
-    if (gestureCount == 1) {
-      Serial.println("[PIR] 1 gesto → ENCENDIENDO relé");
-      setRelay(true);
-    } else if (gestureCount >= 2) {
-      Serial.println("[PIR] 2 gestos → APAGANDO relé");
-      setRelay(false);
+// ===== INTERFAZ WEB =====
+const char HTML_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Control de Luces</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+      min-height: 100vh;
     }
-    gestureCount = 0;
-    firstGestureTime = 0;
-  }
-}
+    h1 { margin-bottom: 2rem; font-size: 1.5rem; color: #a0c4ff; }
+    .card {
+      background: #16213e;
+      border-radius: 12px;
+      padding: 1.5rem;
+      width: 100%;
+      max-width: 360px;
+      margin-bottom: 1.5rem;
+    }
+    h2 { font-size: 1rem; color: #a0c4ff; margin-bottom: 1rem; }
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 0.8rem;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      cursor: pointer;
+      margin-bottom: 0.6rem;
+      transition: opacity 0.2s;
+    }
+    .btn:active { opacity: 0.7; }
+    .btn-on   { background: #4caf50; color: #fff; }
+    .btn-off  { background: #e53935; color: #fff; }
+    .btn-save { background: #0f3460; color: #a0c4ff; border: 1px solid #a0c4ff; }
+    .status { font-size: 0.85rem; color: #aaa; margin-top: 0.5rem; text-align: center; }
+    label { font-size: 0.85rem; color: #aaa; display: block; margin-bottom: 0.3rem; }
+    input[type="time"] {
+      background: #0f3460;
+      border: 1px solid #a0c4ff;
+      color: #eee;
+      border-radius: 6px;
+      padding: 0.4rem 0.6rem;
+      font-size: 0.95rem;
+      width: 100%;
+      margin-bottom: 0.8rem;
+    }
+    .toggle-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.8rem; }
+  </style>
+</head>
+<body>
+  <h1>💡 Control de Luces</h1>
+
+  <div class="card">
+    <h2>🔌 Foco (Relé)</h2>
+    <button class="btn btn-on"  onclick="fetch('/relay/on') .then(()=>updateStatus('relay','ON')) ">Encender</button>
+    <button class="btn btn-off" onclick="fetch('/relay/off').then(()=>updateStatus('relay','OFF'))">Apagar</button>
+    <p class="status" id="relay-status">Estado: --</p>
+  </div>
+
+  <div class="card">
+    <h2>🌈 Tira LED (IR)</h2>
+    <button class="btn btn-on"  onclick="fetch('/ir/on') .then(()=>updateStatus('led','ON')) ">Encender</button>
+    <button class="btn btn-off" onclick="fetch('/ir/off').then(()=>updateStatus('led','OFF'))">Apagar</button>
+    <p class="status" id="led-status">Estado: --</p>
+  </div>
+
+  <div class="card">
+    <h2>⏰ Programación Tira LED</h2>
+    <div class="toggle-row">
+      <input type="checkbox" id="scheduleEnabled" onchange="toggleSchedule(this.checked)">
+      <label for="scheduleEnabled" style="margin:0">Programación activa</label>
+    </div>
+    <label>Hora de encendido</label>
+    <input type="time" id="onTime" value="18:30">
+    <label>Hora de apagado</label>
+    <input type="time" id="offTime" value="22:30">
+    <button class="btn btn-save" onclick="saveSchedule()">Guardar horario</button>
+    <p class="status" id="schedule-status"></p>
+  </div>
+
+  <script>
+    function updateStatus(device, state) {
+      document.getElementById(device === 'relay' ? 'relay-status' : 'led-status')
+        .textContent = 'Estado: ' + state;
+    }
+    function toggleSchedule(enabled) {
+      fetch('/schedule/toggle?enabled=' + (enabled ? '1' : '0'))
+        .then(() => document.getElementById('schedule-status').textContent =
+          enabled ? 'Programación activada' : 'Programación desactivada');
+    }
+    function saveSchedule() {
+      const on  = document.getElementById('onTime').value;
+      const off = document.getElementById('offTime').value;
+      fetch(`/schedule/set?on=${on}&off=${off}`)
+        .then(() => document.getElementById('schedule-status').textContent =
+          `Horario guardado: ${on} – ${off}`);
+    }
+    fetch('/status').then(r => r.json()).then(data => {
+      document.getElementById('relay-status').textContent = 'Estado: ' + (data.relay ? 'ON' : 'OFF');
+      document.getElementById('led-status').textContent   = 'Estado: ' + (data.led   ? 'ON' : 'OFF');
+      document.getElementById('scheduleEnabled').checked  = data.scheduleEnabled;
+      document.getElementById('onTime').value  = data.onTime;
+      document.getElementById('offTime').value = data.offTime;
+    });
+  </script>
+</body>
+</html>
+)rawliteral";
 
 // ===== SETUP =====
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  
-  Serial.println("\n\n===== INICIALIZANDO SISTEMA =====");
-  Serial.println("Sistema IR (Botón → Tira LED)");
-  Serial.println("Sistema PIR (Sensor → Relé/Foco)");
-  
-  // Configurar pines
+  Serial.println("\n===== INICIALIZANDO SISTEMA =====");
+
   irsend.begin();
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(PIR_SENSOR_PIN, INPUT);
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(INTERNAL_LED, OUTPUT);
-  
-  // Estado inicial
-  digitalWrite(RELAY_PIN, LOW);  // Relé apagado al inicio
-  relayState = false;
-  
-  Serial.printf("\nConfiguración:\n");
-  Serial.printf("  IR LED (Tira): GPIO %d\n", kIrLed);
-  Serial.printf("  Botón: GPIO %d\n", BUTTON_PIN);
-  Serial.printf("  PIR Sensor: GPIO %d\n", PIR_SENSOR_PIN);
-  Serial.printf("  Relé: GPIO %d\n", RELAY_PIN);
-  Serial.printf("  LED Interno: GPIO %d\n", INTERNAL_LED);
-  Serial.printf("\nTiempos:\n");
-  Serial.printf("  PIR Debounce: %lu ms\n", PIR_DEBOUNCE_MS);
-  Serial.printf("  PIR Ventana de gestos: %lu ms\n", PIR_GESTURE_WINDOW);
-  Serial.println("\n¡Listo para pruebas!\n");
+  digitalWrite(RELAY_PIN, LOW);
+
+  // WiFi
+  Serial.printf("Conectando a WiFi: %s\n", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.printf("\nConectado. IP: %s\n", WiFi.localIP().toString().c_str());
+
+  // mDNS
+  if (MDNS.begin(MDNS_NAME)) {
+    Serial.printf("mDNS activo: http://%s.local\n", MDNS_NAME);
+  }
+
+  // NTP
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  Serial.println("Hora NTP sincronizada");
+
+  // Rutas
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send_P(200, "text/html", HTML_PAGE);
+  });
+
+  server.on("/relay/on", HTTP_GET, [](AsyncWebServerRequest* req) {
+    setRelay(true);
+    req->send(200, "text/plain", "OK");
+  });
+
+  server.on("/relay/off", HTTP_GET, [](AsyncWebServerRequest* req) {
+    setRelay(false);
+    req->send(200, "text/plain", "OK");
+  });
+
+  server.on("/ir/on", HTTP_GET, [](AsyncWebServerRequest* req) {
+    irOn();
+    req->send(200, "text/plain", "OK");
+  });
+
+  server.on("/ir/off", HTTP_GET, [](AsyncWebServerRequest* req) {
+    irOff();
+    req->send(200, "text/plain", "OK");
+  });
+
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest* req) {
+    char onTime[6], offTime[6];
+    snprintf(onTime,  6, "%02d:%02d", scheduleOnHour,  scheduleOnMin);
+    snprintf(offTime, 6, "%02d:%02d", scheduleOffHour, scheduleOffMin);
+    String json = "{";
+    json += "\"relay\":"           + String(relayState     ? "true" : "false") + ",";
+    json += "\"led\":"             + String(ledStripState   ? "true" : "false") + ",";
+    json += "\"scheduleEnabled\":" + String(scheduleEnabled ? "true" : "false") + ",";
+    json += "\"onTime\":\""        + String(onTime)  + "\",";
+    json += "\"offTime\":\""       + String(offTime) + "\"";
+    json += "}";
+    req->send(200, "application/json", json);
+  });
+
+  server.on("/schedule/toggle", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (req->hasParam("enabled")) {
+      scheduleEnabled = req->getParam("enabled")->value() == "1";
+      Serial.printf("[SCHEDULE] %s\n", scheduleEnabled ? "Activada" : "Desactivada");
+    }
+    req->send(200, "text/plain", "OK");
+  });
+
+  server.on("/schedule/set", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (req->hasParam("on") && req->hasParam("off")) {
+      String on  = req->getParam("on")->value();
+      String off = req->getParam("off")->value();
+      scheduleOnHour  = on.substring(0, 2).toInt();
+      scheduleOnMin   = on.substring(3, 5).toInt();
+      scheduleOffHour = off.substring(0, 2).toInt();
+      scheduleOffMin  = off.substring(3, 5).toInt();
+      Serial.printf("[SCHEDULE] Nuevo horario: %02d:%02d – %02d:%02d\n",
+        scheduleOnHour, scheduleOnMin, scheduleOffHour, scheduleOffMin);
+    }
+    req->send(200, "text/plain", "OK");
+  });
+
+  server.begin();
+  Serial.println("Servidor web iniciado");
+  Serial.println("=================================\n");
 }
 
 // ===== LOOP PRINCIPAL =====
 void loop() {
-  // Sistema 1: Detección del botón (IR)
-  handleButtonPress();
-
-  // Sistema 2: Detección del sensor PIR (Relé)
-  handlePIRDetection();
-  evaluateGestures();
-
-  delay(10);  // Pequeña pausa para no saturar CPU
+  checkSchedule();
+  delay(10);
 }
