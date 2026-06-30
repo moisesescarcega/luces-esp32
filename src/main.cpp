@@ -226,6 +226,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="es">
 <head>
+  <link rel="manifest" href="data:application/manifest+json,{'name':'Control Luces','short_name':'Luces','start_url':'/','display':'standalone'}">
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Control de Luces</title>
@@ -425,7 +426,7 @@ void setup() {
 
   wifiConnected = true;
   Serial.printf("\n[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
-  if (MDNS.begin(MDNS_NAME)) Serial.printf("[mDNS] http://%s.local\n", MDNS_NAME);
+  // if (MDNS.begin(MDNS_NAME)) Serial.printf("[mDNS] http://%s.local\n", MDNS_NAME);
 
   syncHTTP(); 
 
